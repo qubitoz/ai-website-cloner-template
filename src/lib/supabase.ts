@@ -54,6 +54,21 @@ export async function updateProjectStatus(
   if (error) throw error
 }
 
+export async function updateProjectProgress(
+  id: string,
+  fields: { status?: Project["status"]; current_step?: number; ai_log?: string; error_message?: string }
+): Promise<void> {
+  const { error } = await supabase.from("projects").update(fields).eq("id", id)
+  if (error) throw error
+}
+
+export async function appendProjectLog(id: string, text: string): Promise<void> {
+  const { data } = await supabase.from("projects").select("ai_log").eq("id", id).maybeSingle()
+  const current = data?.ai_log ?? ""
+  const { error } = await supabase.from("projects").update({ ai_log: current + text }).eq("id", id)
+  if (error) throw error
+}
+
 export async function deleteProject(id: string): Promise<void> {
   const { error } = await supabase.from("projects").delete().eq("id", id)
   if (error) throw error

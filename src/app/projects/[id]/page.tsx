@@ -1,35 +1,35 @@
 "use client"
 
-import { useEffect, useState, use } from "react"
+import { useEffect, useState, useRef, useCallback, use } from "react"
 import Link from "next/link"
-import { ChevronLeft, ExternalLink, Clock, Pencil } from "lucide-react"
+import { ChevronLeft, ExternalLink, Play, Square, RotateCcw, Check, Loader as Loader2, Circle, CircleAlert as AlertCircle, ChevronRight } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
-import { DesignTokensPanel } from "@/components/design-tokens-panel"
-import { AssetsPanel } from "@/components/assets-panel"
-import { getProject, getDesignTokens, getAssets, updateProjectStatus } from "@/lib/supabase"
-import type { Project, DesignToken, Asset } from "@/types"
+import { getProject, updateProjectProgress } from "@/lib/supabase"
+import { runClonePhase } from "@/lib/openrouter"
+import { useApiKey } from "@/hooks/use-api-key"
+import { CLONE_PHASES, type Project } from "@/types"
 import { cn } from "@/lib/utils"
 
-const TABS = ["Overview", "Design Tokens", "Assets"] as const
-type Tab = typeof TABS[number]
+type PhaseStatus = "pending" | "running" | "complete" | "error"
 
-const STATUS_OPTIONS: Project["status"][] = ["idle", "in-progress", "complete"]
+interface PhaseState {
+  status: PhaseStatus
+  output: string
+}
 
-const statusLabel: Record<Project["status"], string> = {
+const STATUS_LABEL: Record<Project["status"], string> = {
   idle: "Idle",
   "in-progress": "In Progress",
   complete: "Complete",
+  error: "Error",
 }
 
-function formatDate(dateString: string) {
-  return new Intl.DateTimeFormat("en-US", {
-    month: "long",
-    day: "numeric",
-    year: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(new Date(dateString))
+function StepIndicator({ status }: { status: PhaseStatus }) {
+  if (status === "complete") return <Check className="size-3.5 text-green-600 dark:text-green-400" />
+  if (status === "running") return <Loader2 className="size-3.5 animate-spin text-blue-500" />
+  if (status === "error") return <AlertCircle className="size-3.5 text-destructive" />
+  return <Circle className="size-3.5 text-muted-foreground/40" />
 }
 
 export default function ProjectDetailPage({
@@ -38,50 +38,159 @@ export default function ProjectDetailPage({
   params: Promise<{ id: string }>
 }) {
   const { id } = use(params)
+  const { apiKey, loaded: keyLoaded } = useApiKey()
 
   const [project, setProject] = useState<Project | null>(null)
-  const [tokens, setTokens] = useState<DesignToken[]>([])
-  const [assets, setAssets] = useState<Asset[]>([])
   const [loading, setLoading] = useState(true)
-  const [activeTab, setActiveTab] = useState<Tab>("Overview")
-  const [editingStatus, setEditingStatus] = useState(false)
-  const [savingStatus, setSavingStatus] = useState(false)
+  const [running, setRunning] = useState(false)
+  const [activePhase, setActivePhase] = useState<number | null>(null)
+  const [expandedPhase, setExpandedPhase] = useState<number | null>(null)
+  const [phases, setPhases] = useState<PhaseState[]>(
+    CLONE_PHASES.map(() => ({ status: "pending", output: "" }))
+  )
+  const abortRef = useRef<AbortController | null>(null)
+  const logRef = useRef<HTMLDivElement>(null)
 
-  useEffect(() => {
-    async function load() {
-      try {
-        const [proj, toks, ass] = await Promise.all([
-          getProject(id),
-          getDesignTokens(id),
-          getAssets(id),
-        ])
-        setProject(proj)
-        setTokens(toks)
-        setAssets(ass)
-      } finally {
-        setLoading(false)
+  const loadProject = useCallback(async () => {
+    const proj = await getProject(id)
+    setProject(proj)
+    if (proj) {
+      const savedStep = proj.current_step ?? 0
+      const savedLog = proj.ai_log ?? ""
+
+      if (savedLog) {
+        const sections = savedLog.split(/\n\n--- .+ ---\n/)
+
+        setPhases((prev) =>
+          prev.map((p, i) => {
+            const phaseLog = sections[i + 1] ?? ""
+            const status: PhaseStatus =
+              i < savedStep ? "complete" :
+              i === savedStep && proj.status === "in-progress" ? "running" :
+              "pending"
+            return { ...p, status, output: phaseLog }
+          })
+        )
+        setExpandedPhase(savedStep < CLONE_PHASES.length ? savedStep : savedStep - 1)
+      } else if (savedStep > 0) {
+        setPhases((prev) =>
+          prev.map((p, i) => ({
+            ...p,
+            status: i < savedStep ? "complete" : "pending",
+          }))
+        )
+        setExpandedPhase(savedStep < CLONE_PHASES.length ? savedStep : savedStep - 1)
       }
     }
-    load()
+    setLoading(false)
   }, [id])
 
-  async function handleStatusChange(status: Project["status"]) {
-    if (!project) return
-    setSavingStatus(true)
-    try {
-      await updateProjectStatus(id, status)
-      setProject({ ...project, status })
-    } finally {
-      setSavingStatus(false)
-      setEditingStatus(false)
+  useEffect(() => {
+    loadProject()
+  }, [loadProject])
+
+  useEffect(() => {
+    if (logRef.current) {
+      logRef.current.scrollTop = logRef.current.scrollHeight
     }
+  }, [phases, activePhase])
+
+  async function runFromPhase(startIndex: number) {
+    if (!project || !apiKey) return
+    setRunning(true)
+
+    setPhases((prev) =>
+      prev.map((p, i) =>
+        i < startIndex ? p :
+        i === startIndex ? { status: "running", output: "" } :
+        { status: "pending", output: "" }
+      )
+    )
+    setExpandedPhase(startIndex)
+
+    await updateProjectProgress(id, { status: "in-progress", current_step: startIndex, ai_log: "" })
+    setProject((p) => p ? { ...p, status: "in-progress", current_step: startIndex } : p)
+
+    for (let i = startIndex; i < CLONE_PHASES.length; i++) {
+      setActivePhase(i)
+      setExpandedPhase(i)
+      setPhases((prev) =>
+        prev.map((p, idx) => idx === i ? { ...p, status: "running", output: "" } : p)
+      )
+
+      abortRef.current = new AbortController()
+      let phaseOutput = ""
+      let hadError = false
+
+      await new Promise<void>((resolve) => {
+        runClonePhase({
+          projectId: id,
+          url: project.target_url,
+          apiKey,
+          phaseIndex: i,
+          signal: abortRef.current!.signal,
+          onChunk: (text) => {
+            phaseOutput += text
+            setPhases((prev) =>
+              prev.map((p, idx) => idx === i ? { ...p, output: phaseOutput } : p)
+            )
+          },
+          onDone: () => {
+            setPhases((prev) =>
+              prev.map((p, idx) => idx === i ? { ...p, status: "complete", output: phaseOutput } : p)
+            )
+            resolve()
+          },
+          onError: (msg) => {
+            hadError = true
+            setPhases((prev) =>
+              prev.map((p, idx) =>
+                idx === i ? { ...p, status: "error", output: phaseOutput + `\n\nError: ${msg}` } : p
+              )
+            )
+            resolve()
+          },
+        })
+      })
+
+      if (hadError || abortRef.current.signal.aborted) {
+        await updateProjectProgress(id, {
+          status: "error",
+          current_step: i,
+          error_message: hadError ? "Phase failed" : "Stopped by user",
+          ai_log: phases.slice(0, i).map((p) => p.output).join("\n\n") + phaseOutput,
+        })
+        setProject((p) => p ? { ...p, status: "error" } : p)
+        setRunning(false)
+        setActivePhase(null)
+        return
+      }
+
+      await updateProjectProgress(id, { current_step: i + 1 })
+    }
+
+    await updateProjectProgress(id, { status: "complete", current_step: CLONE_PHASES.length })
+    setProject((p) => p ? { ...p, status: "complete" } : p)
+    setRunning(false)
+    setActivePhase(null)
+  }
+
+  function handleStop() {
+    abortRef.current?.abort()
+  }
+
+  function handleRestart() {
+    setPhases(CLONE_PHASES.map(() => ({ status: "pending", output: "" })))
+    setExpandedPhase(null)
+    setActivePhase(null)
+    runFromPhase(0)
   }
 
   if (loading) {
     return (
-      <div className="mx-auto max-w-4xl px-4 sm:px-6 py-8 space-y-4">
-        <div className="h-6 w-24 rounded bg-muted animate-pulse" />
-        <div className="h-10 w-64 rounded bg-muted animate-pulse" />
+      <div className="mx-auto max-w-3xl px-4 sm:px-6 py-8 space-y-4">
+        <div className="h-5 w-20 rounded bg-muted animate-pulse" />
+        <div className="h-8 w-72 rounded bg-muted animate-pulse" />
         <div className="h-4 w-48 rounded bg-muted animate-pulse" />
       </div>
     )
@@ -89,17 +198,18 @@ export default function ProjectDetailPage({
 
   if (!project) {
     return (
-      <div className="mx-auto max-w-4xl px-4 sm:px-6 py-8">
+      <div className="mx-auto max-w-3xl px-4 sm:px-6 py-8">
         <p className="text-sm text-muted-foreground">Project not found.</p>
-        <Link href="/">
-          <Button variant="outline" size="sm" className="mt-4">Back to Projects</Button>
-        </Link>
+        <Link href="/"><Button variant="outline" size="sm" className="mt-4">Back</Button></Link>
       </div>
     )
   }
 
+  const completedCount = phases.filter((p) => p.status === "complete").length
+  const progress = Math.round((completedCount / CLONE_PHASES.length) * 100)
+
   return (
-    <div className="mx-auto max-w-4xl px-4 sm:px-6 py-8">
+    <div className="mx-auto max-w-3xl px-4 sm:px-6 py-8">
       <Link
         href="/"
         className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
@@ -108,159 +218,150 @@ export default function ProjectDetailPage({
         All Projects
       </Link>
 
-      <div className="mb-8">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
-            <h1 className="text-2xl font-semibold truncate">{project.name}</h1>
-            <a
-              href={project.target_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors mt-1"
-            >
-              {project.target_url}
-              <ExternalLink className="size-3" />
-            </a>
-          </div>
-          <div className="shrink-0">
-            {editingStatus ? (
-              <div className="flex items-center gap-1.5">
-                {STATUS_OPTIONS.map((s) => (
-                  <button
-                    key={s}
-                    onClick={() => handleStatusChange(s)}
-                    disabled={savingStatus}
-                    className={cn(
-                      "px-2.5 py-1 rounded-full text-xs font-medium transition-all border",
-                      s === project.status
-                        ? "border-foreground/30 bg-muted"
-                        : "border-transparent hover:border-border hover:bg-muted/50"
-                    )}
-                  >
-                    {statusLabel[s]}
-                  </button>
-                ))}
-                <button
-                  onClick={() => setEditingStatus(false)}
-                  className="text-xs text-muted-foreground hover:text-foreground ml-1"
-                >
-                  Cancel
-                </button>
-              </div>
-            ) : (
-              <button
-                onClick={() => setEditingStatus(true)}
-                className="flex items-center gap-1.5 group"
-              >
-                <Badge variant={project.status as "idle" | "in-progress" | "complete"}>
-                  {statusLabel[project.status]}
-                </Badge>
-                <Pencil className="size-3 text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity" />
-              </button>
-            )}
-          </div>
+      <div className="flex items-start justify-between gap-4 mb-6">
+        <div className="min-w-0">
+          <h1 className="text-xl font-semibold truncate">{project.name}</h1>
+          <a
+            href={project.target_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors mt-0.5"
+          >
+            <span className="truncate max-w-sm">{project.target_url}</span>
+            <ExternalLink className="size-3 shrink-0" />
+          </a>
         </div>
-
-        {project.notes && (
-          <p className="mt-3 text-sm text-muted-foreground max-w-xl">{project.notes}</p>
-        )}
-
-        <div className="flex items-center gap-1.5 mt-3 text-xs text-muted-foreground">
-          <Clock className="size-3" />
-          Created {formatDate(project.created_at)}
-        </div>
-      </div>
-
-      <div className="border-b border-border mb-6">
-        <div className="flex gap-0.5">
-          {TABS.map((tab) => (
-            <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
-              className={cn(
-                "px-3 py-2 text-sm font-medium transition-colors border-b-2 -mb-px",
-                activeTab === tab
-                  ? "border-foreground text-foreground"
-                  : "border-transparent text-muted-foreground hover:text-foreground"
-              )}
+        <div className="flex items-center gap-2 shrink-0">
+          <Badge variant={project.status as "idle" | "in-progress" | "complete"}>
+            {STATUS_LABEL[project.status]}
+          </Badge>
+          {!running && (
+            <Button
+              size="sm"
+              onClick={() => runFromPhase(0)}
+              disabled={!keyLoaded || !apiKey}
+              className="gap-1.5"
+              title={!apiKey ? "Add your OpenRouter API key on the home page first" : undefined}
             >
-              {tab}
-              {tab === "Design Tokens" && tokens.length > 0 && (
-                <span className="ml-1.5 text-xs text-muted-foreground">{tokens.length}</span>
-              )}
-              {tab === "Assets" && assets.length > 0 && (
-                <span className="ml-1.5 text-xs text-muted-foreground">{assets.length}</span>
-              )}
-            </button>
-          ))}
-        </div>
-      </div>
-
-      {activeTab === "Overview" && (
-        <div className="space-y-4">
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-            <div className="rounded-xl border border-border bg-card p-4">
-              <p className="text-xs text-muted-foreground mb-1">Status</p>
-              <Badge variant={project.status as "idle" | "in-progress" | "complete"}>
-                {statusLabel[project.status]}
-              </Badge>
-            </div>
-            <div className="rounded-xl border border-border bg-card p-4">
-              <p className="text-xs text-muted-foreground mb-1">Design Tokens</p>
-              <p className="text-2xl font-semibold">{tokens.length}</p>
-            </div>
-            <div className="rounded-xl border border-border bg-card p-4">
-              <p className="text-xs text-muted-foreground mb-1">Assets Tracked</p>
-              <p className="text-2xl font-semibold">{assets.length}</p>
-            </div>
-          </div>
-
-          <div className="rounded-xl border border-border bg-card p-4 space-y-2">
-            <p className="text-xs text-muted-foreground">Target URL</p>
-            <a
-              href={project.target_url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-sm font-mono text-foreground hover:underline break-all"
-            >
-              {project.target_url}
-            </a>
-          </div>
-
-          {project.notes && (
-            <div className="rounded-xl border border-border bg-card p-4 space-y-1.5">
-              <p className="text-xs text-muted-foreground">Notes</p>
-              <p className="text-sm whitespace-pre-wrap">{project.notes}</p>
+              <Play className="size-3.5" />
+              {project.status === "complete" ? "Re-run" : project.current_step > 0 ? "Continue" : "Run AI Analysis"}
+            </Button>
+          )}
+          {running && (
+            <div className="flex items-center gap-2">
+              <Button size="sm" variant="outline" onClick={handleStop} className="gap-1.5">
+                <Square className="size-3.5" />
+                Stop
+              </Button>
+              <Button size="sm" variant="ghost" onClick={handleRestart} className="gap-1.5">
+                <RotateCcw className="size-3.5" />
+                Restart
+              </Button>
             </div>
           )}
+        </div>
+      </div>
 
-          <div className="rounded-xl border border-border bg-card p-4 grid grid-cols-2 gap-4">
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Created</p>
-              <p className="text-sm">{formatDate(project.created_at)}</p>
-            </div>
-            <div>
-              <p className="text-xs text-muted-foreground mb-1">Last Updated</p>
-              <p className="text-sm">{formatDate(project.updated_at)}</p>
-            </div>
+      {!apiKey && keyLoaded && (
+        <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-900/20 px-4 py-3 text-sm text-amber-700 dark:text-amber-400">
+          Add your OpenRouter API key on the{" "}
+          <Link href="/" className="underline font-medium">home page</Link>{" "}
+          to run the AI analysis.
+        </div>
+      )}
+
+      {completedCount > 0 && (
+        <div className="mb-4">
+          <div className="flex justify-between text-xs text-muted-foreground mb-1.5">
+            <span>{completedCount} of {CLONE_PHASES.length} phases complete</span>
+            <span>{progress}%</span>
+          </div>
+          <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+            <div
+              className="h-full rounded-full bg-green-500 transition-all duration-500"
+              style={{ width: `${progress}%` }}
+            />
           </div>
         </div>
       )}
 
-      {activeTab === "Design Tokens" && (
-        <DesignTokensPanel
-          projectId={id}
-          tokens={tokens}
-          onTokensChange={setTokens}
-        />
-      )}
+      <div className="space-y-2">
+        {CLONE_PHASES.map((phase) => {
+          const phaseState = phases[phase.index]
+          const isExpanded = expandedPhase === phase.index
+          const hasOutput = phaseState.output.length > 0
 
-      {activeTab === "Assets" && (
-        <AssetsPanel
-          projectId={id}
-          assets={assets}
-          onAssetsChange={setAssets}
-        />
+          return (
+            <div
+              key={phase.index}
+              className={cn(
+                "rounded-xl border transition-colors",
+                phaseState.status === "running" ? "border-blue-200 dark:border-blue-800 bg-blue-50/50 dark:bg-blue-950/20" :
+                phaseState.status === "complete" ? "border-green-200/70 dark:border-green-900/50 bg-green-50/30 dark:bg-green-950/10" :
+                phaseState.status === "error" ? "border-destructive/30 bg-destructive/5" :
+                "border-border bg-card"
+              )}
+            >
+              <button
+                onClick={() => setExpandedPhase(isExpanded ? null : phase.index)}
+                disabled={!hasOutput && phaseState.status === "pending"}
+                className="w-full flex items-center gap-3 px-4 py-3 text-left"
+              >
+                <div className={cn(
+                  "flex size-6 shrink-0 items-center justify-center rounded-full border",
+                  phaseState.status === "complete" ? "border-green-300 bg-green-100 dark:border-green-700 dark:bg-green-900/30" :
+                  phaseState.status === "running" ? "border-blue-300 bg-blue-100 dark:border-blue-700 dark:bg-blue-900/30" :
+                  phaseState.status === "error" ? "border-destructive/40 bg-destructive/10" :
+                  "border-border bg-muted/50"
+                )}>
+                  <StepIndicator status={phaseState.status} />
+                </div>
+
+                <div className="flex-1 min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span className={cn(
+                      "text-sm font-medium",
+                      phaseState.status === "pending" ? "text-muted-foreground" : "text-foreground"
+                    )}>
+                      {phase.name}
+                    </span>
+                    {phaseState.status === "running" && (
+                      <span className="text-xs text-blue-600 dark:text-blue-400 animate-pulse">Analyzing…</span>
+                    )}
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-0.5">{phase.description}</p>
+                </div>
+
+                {hasOutput && (
+                  <ChevronRight className={cn(
+                    "size-4 text-muted-foreground transition-transform shrink-0",
+                    isExpanded && "rotate-90"
+                  )} />
+                )}
+              </button>
+
+              {isExpanded && hasOutput && (
+                <div className="px-4 pb-4">
+                  <div
+                    ref={phaseState.status === "running" ? logRef : undefined}
+                    className="rounded-lg bg-muted/60 border border-border/50 px-4 py-3 font-mono text-xs text-foreground/80 leading-relaxed whitespace-pre-wrap max-h-80 overflow-y-auto"
+                  >
+                    {phaseState.output}
+                    {phaseState.status === "running" && (
+                      <span className="inline-block w-1.5 h-3.5 bg-foreground/60 animate-pulse ml-0.5 align-middle" />
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )
+        })}
+      </div>
+
+      {project.error_message && (
+        <div className="mt-4 rounded-lg border border-destructive/30 bg-destructive/5 px-4 py-3 text-sm text-destructive">
+          {project.error_message}
+        </div>
       )}
     </div>
   )

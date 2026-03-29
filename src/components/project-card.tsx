@@ -16,6 +16,7 @@ const statusLabel: Record<Project["status"], string> = {
   idle: "Idle",
   "in-progress": "In Progress",
   complete: "Complete",
+  error: "Error",
 }
 
 function formatDate(dateString: string) {

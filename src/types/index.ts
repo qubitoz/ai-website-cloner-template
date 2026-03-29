@@ -1,4 +1,4 @@
-export type ProjectStatus = "idle" | "in-progress" | "complete"
+export type ProjectStatus = "idle" | "in-progress" | "complete" | "error"
 
 export type DesignTokenCategory =
   | "color"
@@ -17,6 +17,9 @@ export interface Project {
   status: ProjectStatus
   notes: string
   screenshot_url: string
+  current_step: number
+  ai_log: string
+  error_message: string
   created_at: string
   updated_at: string
 }
@@ -45,3 +48,12 @@ export interface NewProjectInput {
   target_url: string
   notes?: string
 }
+
+export const CLONE_PHASES = [
+  { index: 0, name: "Pre-Flight Check", description: "Verify URL, environment, and requirements" },
+  { index: 1, name: "Reconnaissance", description: "Screenshots, design tokens, interaction sweep, page topology" },
+  { index: 2, name: "Foundation Build", description: "Fonts, colors, TypeScript types, SVGs, assets" },
+  { index: 3, name: "Component Specification", description: "Write specs and dispatch builder agents" },
+  { index: 4, name: "Page Assembly", description: "Wire components, implement behaviors, verify build" },
+  { index: 5, name: "Visual QA", description: "Side-by-side comparison and interaction verification" },
+] as const
